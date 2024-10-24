@@ -1,9 +1,10 @@
 // shadow_memory.c
 //아직 테스트되지 않음
-#include "shadow_memory.h"
+//#include "shadow_memory.h"
 #include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <errno.h>
 #include <string.h>
 
@@ -13,7 +14,7 @@
 //#define SHADOW_SIZE (1ULL << 32) //큰 사이즈 할당시 에러나서 일단 작은 사이즈로 대체
 
 //섀도우 메모리 포인터
-static uint8_t* shadow_memory = (uint8_t*)SHADOW_OFFSET;
+static int8_t* shadow_memory = (int8_t*)SHADOW_OFFSET;
 
 void allocate_shadow_memory() {
     void* addr = mmap(
@@ -43,27 +44,25 @@ void free_shadow_memory() {
 }
 
 //프로그램 메모리 주소 받아서 섀도우 메모리 주소 계산
-static inline uint8_t* get_shadow_address(void* addr) {
+static inline int8_t* get_shadow_address(void* addr) {
     return shadow_memory + (((uintptr_t)addr) >> SHADOW_SCALE);
 }
 
 //프로그램 메모리 주소가 매핑된 섀도우 메모리 블록의 몇번째 요소인지 리턴(0~7)
-static inline uint8_t get_shadow_block_offset(void* addr) {
-    return ((uintptr_t)addr) & ((1 << SHADOW_OFFSET) - 1);
+static inline size_t get_shadow_block_offset(void* addr) {
+    return ((uintptr_t)addr) & ((1 << SHADOW_SCALE) - 1);
 }
 
-/*필요없음
+//프로그램 메모리 크기를 섀도우 메모리 크기로 변환
 static inline size_t get_shadow_size(size_t size) {
     return ((size - 1) >> SHADOW_SCALE) + 1;
 }
-*/
 
 //우선 malloc먼저 구현(calloc, realloc, aligned_alloc, valloc, posix_memalign??)
 void* wrapper_malloc(size_t size) {
     void* addr = malloc(size); //8바이트 정렬된 주소로 할당
     if (addr) {
-        uint8_t* shadow_addr = get_shadow_address(addr);
-        //size_t shadow_size = get_shadow_size(size);
+        int8_t* shadow_addr = get_shadow_address(addr);
 
         /*validate_memory_access의 논리를 그대로 가져오기.
         하지만 8바이트 정렬된 주소이기 때문에 좀 단순함
@@ -72,8 +71,12 @@ void* wrapper_malloc(size_t size) {
         예를들어 28바이트 할당이면
         24바이트에 해당하는 3바이트는 8로 채우고, 나머지 4바이트에 해당하는 1바이트는 4로 세팅*/
 
-        //uint8_t encoding =  size & ((1 << SHADOW_SCALE) - 1);
-        //memset(shadow_addr, 0, shadow_size);
+        //몫, 나머지
+        size_t shadow_full_size = size >> SHADOW_SCALE;
+        size_t shadow_remainder_size = size & ((1 << SHADOW_SCALE) - 1);
+
+        if (shadow_full_size) memset(shadow_addr, 8, shadow_full_size);
+        if (shadow_remainder_size) memset(shadow_addr + shadow_full_size, shadow_remainder_size, 1);
     }
     return addr;
 }
@@ -81,19 +84,18 @@ void* wrapper_malloc(size_t size) {
 //pass가 적용될 소스코드의 free함수에는 size가 전달되지 않음. softbound에 사용할 메타데이터를 이용해 size를 알아내야 할 듯
 //double free도 감지 가능?
 void wrapper_free(void* addr, size_t size) {
+    free(addr);
     if (addr) {
-        uint8_t* shadow_addr = get_shadow_address(addr);
+        int8_t* shadow_addr = get_shadow_address(addr);
         size_t shadow_size = get_shadow_size(size);
 
-        //생각
-        memset(shadow_addr, 0, shadow_size);
-        free(addr);
+        memset(shadow_addr, -1, shadow_size);
     }
 }
 
 void validate_memory_access(void* addr, size_t size) {
-    uint8_t* shadow_addr = get_shadow_address(addr);
-    uint8_t shadow_block_offset = get_shadow_block_offset(addr);
+    int8_t* shadow_addr = get_shadow_address(addr);
+    size_t shadow_block_offset = get_shadow_block_offset(addr);
     //size_t shadow_size = get_shadow_size(size); //필요없음
 
     //인코딩정의에 따른 처리
