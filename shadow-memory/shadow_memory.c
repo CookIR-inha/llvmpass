@@ -1,17 +1,16 @@
-// shadow_memory.c
-//아직 테스트되지 않음
-//#include "shadow_memory.h"
+//shadow_memory.c
+//gcc -fPIC -shared -o libshadow_memory.so shadow_memory.c
+#include "shadow_memory.h"
 #include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <stdint.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
 
 #define SHADOW_SCALE 3
 #define SHADOW_OFFSET 0x100000000000ULL // 2^44
 #define SHADOW_SIZE 1ULL << (47 - SHADOW_SCALE) // 2^44 bytes (16TiB)
-//#define SHADOW_SIZE (1ULL << 32) //큰 사이즈 할당시 에러나서 일단 작은 사이즈로 대체
 
 //섀도우 메모리 포인터
 static int8_t* shadow_memory = (int8_t*)SHADOW_OFFSET;
@@ -75,8 +74,9 @@ void* wrapper_malloc(size_t size) {
         size_t shadow_full_size = size >> SHADOW_SCALE;
         size_t shadow_remainder_size = size & ((1 << SHADOW_SCALE) - 1);
 
+        //완전한 8바이트 블록은 인코딩 값 8로 채우고, 나머지 한 블록은 남은 바이트 수가 인코딩 값임
         if (shadow_full_size) memset(shadow_addr, 8, shadow_full_size);
-        if (shadow_remainder_size) memset(shadow_addr + shadow_full_size, shadow_remainder_size, 1);
+        if (shadow_remainder_size) shadow_addr[shadow_full_size] = shadow_remainder_size;
     }
     return addr;
 }
