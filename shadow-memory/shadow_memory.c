@@ -35,10 +35,6 @@ void allocate_shadow_memory() {
         munmap(addr, SHADOW_SIZE);
         _exit(1);
     }
-
-    //memset(shadow_memory, -1, SHADOW_SIZE);
-    //메모리 사용량 많아서 프로세스 죽음(Killed 뜸). how?
-    //일단 인코딩 정의 변경해봄.
 }
 
 //해제할 필요가 있는지 의문(프로세스 종료할때까지 사용할꺼니까..)
@@ -46,34 +42,44 @@ void free_shadow_memory() {
     munmap(shadow_memory, SHADOW_SIZE);
 }
 
+//프로그램 메모리 주소 받아서 섀도우 메모리 주소 계산
 static inline uint8_t* get_shadow_address(void* addr) {
     return shadow_memory + (((uintptr_t)addr) >> SHADOW_SCALE);
 }
 
+//프로그램 메모리 주소가 매핑된 섀도우 메모리 블록의 몇번째 요소인지 리턴(0~7)
 static inline uint8_t get_shadow_block_offset(void* addr) {
     return ((uintptr_t)addr) & ((1 << SHADOW_OFFSET) - 1);
 }
 
+/*필요없음
 static inline size_t get_shadow_size(size_t size) {
     return ((size - 1) >> SHADOW_SCALE) + 1;
 }
+*/
 
 //우선 malloc먼저 구현(calloc, realloc, aligned_alloc, valloc, posix_memalign??)
 void* wrapper_malloc(size_t size) {
     void* addr = malloc(size); //8바이트 정렬된 주소로 할당
     if (addr) {
         uint8_t* shadow_addr = get_shadow_address(addr);
-        size_t shadow_size = get_shadow_size(size);
+        //size_t shadow_size = get_shadow_size(size);
 
+        /*validate_memory_access의 논리를 그대로 가져오기.
+        하지만 8바이트 정렬된 주소이기 때문에 좀 단순함
+        앞부분은 8로 memset하면 되고
+        마지막 영역은 8로 나눈 나머지만큼을 값 세팅
+        예를들어 28바이트 할당이면
+        24바이트에 해당하는 3바이트는 8로 채우고, 나머지 4바이트에 해당하는 1바이트는 4로 세팅*/
 
-        //반복문 필요?
-        uint8_t encoding =  size & ((1 << SHADOW_SCALE) - 1);
-        memset(shadow_addr, 0, shadow_size);
+        //uint8_t encoding =  size & ((1 << SHADOW_SCALE) - 1);
+        //memset(shadow_addr, 0, shadow_size);
     }
     return addr;
 }
 
 //pass가 적용될 소스코드의 free함수에는 size가 전달되지 않음. softbound에 사용할 메타데이터를 이용해 size를 알아내야 할 듯
+//double free도 감지 가능?
 void wrapper_free(void* addr, size_t size) {
     if (addr) {
         uint8_t* shadow_addr = get_shadow_address(addr);
@@ -88,7 +94,7 @@ void wrapper_free(void* addr, size_t size) {
 void validate_memory_access(void* addr, size_t size) {
     uint8_t* shadow_addr = get_shadow_address(addr);
     uint8_t shadow_block_offset = get_shadow_block_offset(addr);
-    size_t shadow_size = get_shadow_size(size);
+    //size_t shadow_size = get_shadow_size(size); //필요없음
 
     //인코딩정의에 따른 처리
     //8이면 8바이트 전부 접근 가능
@@ -97,11 +103,33 @@ void validate_memory_access(void* addr, size_t size) {
     //k == -1이면 해제된 영역(접근 불가)
 
     //addr이 몇 번째 바이트에 접근하는지도 고려해야 함
-    //
-    for (size_t i = 0; i < shadow_size - 1; i++) {
+    
+    //첫번째 블록에서 유효해야 하는 바이트 크기
+    size_t first_bytes = shadow_block_offset + size;
+    if (first_bytes > 8) first_bytes = 8;
+    
+    if (first_bytes > shadow_addr[0]) {
+        fprintf(stderr, "Invalid memory access at %p\n", addr);
+        _exit(1);
+    }
+
+    if (first_bytes == 8) {
+        size = size - (8 - shadow_block_offset);
+    }
+    else {
+        size = 0;
+    }
+    
+    size_t i = 1;
+    for (; size >= 8; i++, size -= 8) {
          if (shadow_addr[i] != 8) {
             fprintf(stderr, "Invalid memory access at %p\n", addr);
             _exit(1);
         }
+    }
+
+    if (size > shadow_addr[i]) {
+        fprintf(stderr, "Invalid memory access at %p\n", addr);
+        _exit(1);
     }
 }
