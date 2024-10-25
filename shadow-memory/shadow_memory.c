@@ -15,6 +15,7 @@
 //섀도우 메모리 포인터
 static int8_t* shadow_memory = (int8_t*)SHADOW_OFFSET;
 
+//섀도우 메모리 할당(초기에 호출되어야 함)
 void allocate_shadow_memory() {
     void* addr = mmap(
         shadow_memory,
@@ -37,7 +38,7 @@ void allocate_shadow_memory() {
     }
 }
 
-//해제할 필요가 있는지 의문(프로세스 종료할때까지 사용할꺼니까..)
+//섀도우 메모리 해제(프로그램 종료시에 호출. 어차피 종료할건데 호출할 필요가 있는지 모르겠음)
 void free_shadow_memory() {
     munmap(shadow_memory, SHADOW_SIZE);
 }
@@ -47,12 +48,14 @@ static inline int8_t* get_shadow_address(void* addr) {
     return shadow_memory + (((uintptr_t)addr) >> SHADOW_SCALE);
 }
 
-//프로그램 메모리 주소가 매핑된 섀도우 메모리 블록의 몇번째 요소인지 리턴(0~7)
+//프로그램 메모리 주소가 섀도우 메모리 블록의 8바이트 중 몇번째에 해당하는지 리턴(0~7)
+//즉, 메모리 주소를 8로 나눈 나머지
 static inline size_t get_shadow_block_offset(void* addr) {
     return ((uintptr_t)addr) & ((1 << SHADOW_SCALE) - 1);
 }
 
 //프로그램 메모리 크기를 섀도우 메모리 크기로 변환
+//1-8이면 1, 9-16이면 2 ...
 static inline size_t get_shadow_size(size_t size) {
     return ((size - 1) >> SHADOW_SCALE) + 1;
 }
@@ -63,20 +66,17 @@ void* wrapper_malloc(size_t size) {
     if (addr) {
         int8_t* shadow_addr = get_shadow_address(addr);
 
-        /*validate_memory_access의 논리를 그대로 가져오기.
-        하지만 8바이트 정렬된 주소이기 때문에 좀 단순함
-        앞부분은 8로 memset하면 되고
-        마지막 영역은 8로 나눈 나머지만큼을 값 세팅
-        예를들어 28바이트 할당이면
-        24바이트에 해당하는 3바이트는 8로 채우고, 나머지 4바이트에 해당하는 1바이트는 4로 세팅*/
-
-        //몫, 나머지
+        //8로 나눈 몫과 나머지
         size_t shadow_full_size = size >> SHADOW_SCALE;
         size_t shadow_remainder_size = size & ((1 << SHADOW_SCALE) - 1);
 
         //완전한 8바이트 블록은 인코딩 값 8로 채우고, 나머지 한 블록은 남은 바이트 수가 인코딩 값임
         if (shadow_full_size) memset(shadow_addr, 8, shadow_full_size);
         if (shadow_remainder_size) shadow_addr[shadow_full_size] = shadow_remainder_size;
+
+        /*예를들어 26바이트 할당인 경우
+        28 = 8*3 + 2 이므로
+        인코딩 값: [8, 8, 8, 2]*/
     }
     return addr;
 }
@@ -88,40 +88,63 @@ void wrapper_free(void* addr, size_t size) {
     if (addr) {
         int8_t* shadow_addr = get_shadow_address(addr);
         size_t shadow_size = get_shadow_size(size);
-
+        
+        //섀도우 메모리에 할당 해제됨을 표시
         memset(shadow_addr, -1, shadow_size);
     }
 }
 
+
+/*
+인코딩 정의
+섀도우 바이트의 값 k
+k = 0이면 할당되지 않은 영역(접근 불가)
+1 <= k <= 8이면 첫 k바이트만 접근 가능(8이면 8바이트 전체 접근 가능)
+k = -1이면 해제된 영역(접근 불가)
+*/
+
+//메모리 접근을 검증(메모리 접근 명령어 앞에 삽입되어야 하는 함수)
 void validate_memory_access(void* addr, size_t size) {
     int8_t* shadow_addr = get_shadow_address(addr);
     size_t shadow_block_offset = get_shadow_block_offset(addr);
-    //size_t shadow_size = get_shadow_size(size); //필요없음
-
-    //인코딩정의에 따른 처리
-    //8이면 8바이트 전부 접근 가능
-    //1~8이면 첫 k바이트만 접근 가능
-    //k == 0이면 할당되지 않은 영역(접근 불가)
-    //k == -1이면 해제된 영역(접근 불가)
-
-    //addr이 몇 번째 바이트에 접근하는지도 고려해야 함
     
-    //첫번째 블록에서 유효해야 하는 바이트 크기
+    /*
+    메모리 접근은 할당과 달리 8바이트 정렬이 보장되지 않음
+    다양한 메모리 접근 case가 있음(1블록 접근, 여러 블록 접근, 8바이트 정렬된 접근, 정렬되지 않은 접근..)
+    따라서 일반화를 위해 첫 블록, 중간 블록, 마지막 블록으로 나누어 처리해야 함
+    예시)
+    섀도우 메모리 오프셋: 0x0
+    메모리 접근 주소와 사이즈: 0x4, 32byte
+    전체 접근 주소: 0x04-0x23 (32byte)
+    첫 블록의 접근 주소: 0x4-0x7 (4byte)
+    중간 블록의 접근 주소: 0x8-0xf, 0x10-0x17, 0x18-0x1f (24byte)
+    마지막 블록의 접근 주소: 0x20-0x23 (4byte)
+
+    이 경우 첫 블록에서는 마지막 4바이트만 접근하지만
+    할당할 때 8바이트 정렬된 주소로부터 연속으로 할당되었으므로 해당 블록의 8바이트 전체가 유효해야만 접근 가능함
+    중간 블록의 경우 항상 8바이트 전체가 유효해야 접근 가능함
+    마지막 블록의 경우 첫 4바이트만 유효하면 접근 가능함
+    */
+
+    //첫 블록에서 유효해야 하는 바이트 크기
     size_t first_bytes = shadow_block_offset + size;
     if (first_bytes > 8) first_bytes = 8;
     
+    //접근 가능한지 확인
     if (first_bytes > shadow_addr[0]) {
         fprintf(stderr, "Invalid memory access at %p\n", addr);
         _exit(1);
     }
 
+    //첫 블록에서 접근한 만큼 빼줌.
     if (first_bytes == 8) {
         size = size - (8 - shadow_block_offset);
     }
-    else {
+    else {//접근 영역 전체가 1블록을 초과하지 않는다면 더 이상 진행할 필요 없으므로 size = 0
         size = 0;
     }
     
+    //중간 블록에 대해 접근 가능한지 확인
     size_t i = 1;
     for (; size >= 8; i++, size -= 8) {
          if (shadow_addr[i] != 8) {
@@ -130,6 +153,7 @@ void validate_memory_access(void* addr, size_t size) {
         }
     }
 
+    //마지막 블록에 대해 접근 가능한지 확인
     if (size > shadow_addr[i]) {
         fprintf(stderr, "Invalid memory access at %p\n", addr);
         _exit(1);
