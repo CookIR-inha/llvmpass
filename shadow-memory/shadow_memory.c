@@ -75,7 +75,7 @@ void* wrapper_malloc(size_t size) {
         if (shadow_remainder_size) shadow_addr[shadow_full_size] = shadow_remainder_size;
 
         /*예를들어 26바이트 할당인 경우
-        28 = 8*3 + 2 이므로
+        26 = 8*3 + 2 이므로
         인코딩 값: [8, 8, 8, 2]*/
     }
     return addr;
@@ -104,7 +104,7 @@ k = -1이면 해제된 영역(접근 불가)
 */
 
 //메모리 접근을 검증(메모리 접근 명령어 앞에 삽입되어야 하는 함수)
-void validate_memory_access(void* addr, size_t size) {
+void validate_memory_access(void* addr, int32_t size) {
     int8_t* shadow_addr = get_shadow_address(addr);
     size_t shadow_block_offset = get_shadow_block_offset(addr);
     
@@ -127,7 +127,7 @@ void validate_memory_access(void* addr, size_t size) {
     */
 
     //첫 블록에서 유효해야 하는 바이트 크기
-    size_t first_bytes = shadow_block_offset + size;
+    int32_t first_bytes = shadow_block_offset + size;
     if (first_bytes > 8) first_bytes = 8;
     
     //접근 가능한지 확인
