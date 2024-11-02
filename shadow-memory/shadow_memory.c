@@ -94,6 +94,13 @@ void wrapper_free(void* addr, size_t size) {
     }
 }
 
+//validate_memory_access함수가 부적절한 메모리 접근을 감지하면 호출
+void report_error(void* addr, size_t size, int8_t enc) {
+    //fprintf(stderr, "Invalid memory access at %p\n", addr);
+    //주소, 크기, 에러 종류 리포트 해야 함
+    //근데, 주소 뿐 아니라 어떤 코드에서 에러가 났는지 알려줘야 할텐데..
+    _exit(1);
+}
 
 /*
 인코딩 정의
@@ -132,8 +139,7 @@ void validate_memory_access(void* addr, int32_t size) {
     
     //접근 가능한지 확인
     if (first_bytes > shadow_addr[0]) {
-        fprintf(stderr, "Invalid memory access at %p\n", addr);
-        _exit(1);
+        report_error(addr, size, shadow_addr[0]);
     }
 
     //첫 블록에서 접근한 만큼 빼줌.
@@ -148,14 +154,12 @@ void validate_memory_access(void* addr, int32_t size) {
     size_t i = 1;
     for (; size >= 8; i++, size -= 8) {
          if (shadow_addr[i] != 8) {
-            fprintf(stderr, "Invalid memory access at %p\n", addr);
-            _exit(1);
+            report_error(addr, size, shadow_addr[i]);
         }
     }
 
     //마지막 블록에 대해 접근 가능한지 확인
     if (size > shadow_addr[i]) {
-        fprintf(stderr, "Invalid memory access at %p\n", addr);
-        _exit(1);
+        report_error(addr, size, shadow_addr[i]);
     }
 }

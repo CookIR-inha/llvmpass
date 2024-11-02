@@ -20,6 +20,8 @@ void* wrapper_malloc(size_t size);
 
 void wrapper_free(void* addr, size_t size);
 
+void report_error(void* addr, size_t size, int8_t enc);
+
 void validate_memory_access(void* addr, int32_t size);
 
 #endif
