@@ -95,10 +95,121 @@ void wrapper_free(void* addr, size_t size) {
 }
 
 //validate_memory_access함수가 부적절한 메모리 접근을 감지하면 호출
-void report_error(void* addr, size_t size, int8_t enc) {
-    //fprintf(stderr, "Invalid memory access at %p\n", addr);
-    //주소, 크기, 에러 종류 리포트 해야 함
-    //근데, 주소 뿐 아니라 어떤 코드에서 에러가 났는지 알려줘야 할텐데..
+void report_error(void* start_addr, size_t size, int8_t* faulty_shadow_addr) {
+
+    fprintf(stderr, "\n=============================================================================================\n");
+    int8_t enc = *faulty_shadow_addr;
+    //enc == 0 이면 반드시 할당되지 않은 영역임
+    //enc == -1 이면 해제된 영역임
+    //enc > 0 이면 해제된 영역이거나, 할당되지 않은 영역임(예를들어, 앞의 4바이트만 할당된 경우 인코딩 값은 4이고, 뒤의 4바이트는 해제된 영역인지 할당되지 않은 영역인지 알 수 없음)
+    char *error_type;
+    if (enc == -1) {
+        error_type = "Use-After-Free detected";
+    } else if (enc == 0) {
+        error_type = "Access to unallocated memory region";
+    } else {
+        error_type = "Invalid memory access detected (Unallocated or freed memory region)";
+    }
+    fprintf(stderr, "********** %s **********\n\n", error_type);
+
+    //문제가 발생한 주소
+    void* faulty_addr = (void*)(((uintptr_t)faulty_shadow_addr - (uintptr_t)shadow_memory) << SHADOW_SCALE);
+    if (enc > 0) {
+        faulty_addr = (void*)((uintptr_t)faulty_addr + enc);
+    }
+    if (start_addr > faulty_addr) {
+        faulty_addr = start_addr;
+    }
+
+    fprintf(stderr, "Access address : %p\n", start_addr);
+    fprintf(stderr, "Access size    : %zu bytes\n", size);
+    fprintf(stderr, "Faulty address : %p\n", faulty_addr);
+
+    //메모리 내용 출력
+    fprintf(stderr, "\nMemory dump: \n\n%-19s   %-25s %s\n", "Address", "Content", "Status");
+
+    void* faulty_addr_block = (void*)((uintptr_t)faulty_addr & ~0x7);
+
+    int before_blocks = 6;
+    int after_blocks = 6;
+
+    uintptr_t last_digit = ((uintptr_t)faulty_addr_block) & 0xF;
+    if (last_digit == 0x0) {
+        after_blocks = 7;
+    } else {
+        before_blocks = 7;
+    }
+    
+    void* start_addr_block = (void*)((uintptr_t)faulty_addr_block - before_blocks * 8);
+    void* end_addr_block = (void*)((uintptr_t)faulty_addr_block + after_blocks * 8);
+
+    for (void* cur_addr_block = start_addr_block; cur_addr_block <= end_addr_block; cur_addr_block += 8) {
+        int8_t* cur_shadow_addr = get_shadow_address(cur_addr_block);
+        int8_t shadow_enc = *cur_shadow_addr;
+
+        // 주소 출력
+        if (cur_addr_block == faulty_addr_block) {
+            fprintf(stderr, "\033[32m%19p\033[0m |", cur_addr_block); //초록
+        } else {
+            fprintf(stderr, "%19p |", cur_addr_block);
+        }
+
+        // 메모리 내용 가져오기
+        uint8_t mem_content[8];
+        memcpy(mem_content, cur_addr_block, 8);
+
+        if (shadow_enc > 0) {
+            size_t i;
+            for (i = 0; i < shadow_enc; i++) {
+                fprintf(stderr, " %02X", mem_content[i]);
+            }
+            for (; i < 8; i++) {
+                if (cur_addr_block + i == faulty_addr) { //이 비교 구문은 cur_addr_block == faulty_addr_block일 때만 실행되면 되지만, 성능 희생이 미미하고 가독성을 해치지 않기 위해 이렇게 유지함
+                    fprintf(stderr, ">\033[33m%02X\033[0m", mem_content[i]); //노랑
+                } else {
+                    fprintf(stderr, " \033[33m%02X\033[0m", mem_content[i]); //노랑
+                }
+            }
+        } else {
+            if (shadow_enc == 0) {
+                for (int i = 0; i < 8; i++) {
+                    if (cur_addr_block + i == faulty_addr) {
+                        fprintf(stderr, ">\033[35m%02X\033[0m", mem_content[i]); //보라
+                    } else {
+                        fprintf(stderr, " \033[35m%02X\033[0m", mem_content[i]); //보라
+                    }
+                }
+            } else if (shadow_enc == -1) {
+                for (int i = 0; i < 8; i++) {
+                    if (cur_addr_block + i == faulty_addr) {
+                        fprintf(stderr, ">\033[31m%02X\033[0m", mem_content[i]); //빨강
+                    } else {
+                        fprintf(stderr, " \033[31m%02X\033[0m", mem_content[i]); //빨강
+                    }
+                }
+            }
+        }
+        fprintf(stderr, " | ");
+
+        if (cur_addr_block == faulty_addr_block) {
+            fprintf(stderr, "\033[32m"); //초록
+        }
+
+        if (shadow_enc == 0) {
+            fprintf(stderr, "Unallocated\n\033[0m");
+        } else if (shadow_enc == -1) {
+            fprintf(stderr, "Freed\n\033[0m");
+        } else if (shadow_enc == 8) {
+            fprintf(stderr, "Valid\n\033[0m");
+        } else {
+            fprintf(stderr, "%d Valid/%d Invalid(unallocated or freed)\n\033[0m", shadow_enc, 8 - shadow_enc);
+        }
+    
+    }
+
+    fprintf(stderr, "\n=============================================================================================\n");
+
+
     _exit(1);
 }
 
@@ -139,27 +250,28 @@ void validate_memory_access(void* addr, int32_t size) {
     
     //접근 가능한지 확인
     if (first_bytes > shadow_addr[0]) {
-        report_error(addr, size, shadow_addr[0]);
+        report_error(addr, size, shadow_addr);
     }
 
+    int32_t remaining_size = size;
     //첫 블록에서 접근한 만큼 빼줌.
     if (first_bytes == 8) {
-        size = size - (8 - shadow_block_offset);
+        remaining_size = remaining_size - (8 - shadow_block_offset);
     }
     else {//접근 영역 전체가 1블록을 초과하지 않는다면 더 이상 진행할 필요 없으므로 size = 0
-        size = 0;
+        remaining_size = 0;
     }
     
     //중간 블록에 대해 접근 가능한지 확인
     size_t i = 1;
-    for (; size >= 8; i++, size -= 8) {
+    for (; remaining_size >= 8; i++, remaining_size -= 8) {
          if (shadow_addr[i] != 8) {
-            report_error(addr, size, shadow_addr[i]);
+            report_error(addr, size, &shadow_addr[i]);
         }
     }
 
     //마지막 블록에 대해 접근 가능한지 확인
-    if (size > shadow_addr[i]) {
-        report_error(addr, size, shadow_addr[i]);
+    if (remaining_size > shadow_addr[i]) {
+        report_error(addr, size, &shadow_addr[i]);
     }
 }
