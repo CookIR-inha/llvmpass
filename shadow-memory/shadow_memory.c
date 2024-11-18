@@ -60,26 +60,132 @@ static inline size_t get_shadow_size(size_t size) {
     return ((size - 1) >> SHADOW_SCALE) + 1;
 }
 
-//우선 malloc먼저 구현(calloc, realloc, aligned_alloc, valloc, posix_memalign??)
+//섀도우 메모리에 인코딩 값 '할당됨'으로 설정(1-8)
+void set_shadow_enc_alloc(void* addr, size_t size) {
+    int8_t* shadow_addr = get_shadow_address(addr);
+
+    //8로 나눈 몫과 나머지
+    size_t shadow_full_size = size >> SHADOW_SCALE;
+    size_t shadow_remainder_size = size & ((1 << SHADOW_SCALE) - 1);
+
+    //완전한 8바이트 블록은 인코딩 값 8로 채우고, 나머지 한 블록은 남은 바이트 수가 인코딩 값임
+    if (shadow_full_size) memset(shadow_addr, 8, shadow_full_size);
+    if (shadow_remainder_size) shadow_addr[shadow_full_size] = shadow_remainder_size;
+
+    /*예를들어 26바이트 할당인 경우
+    26 = 8*3 + 2 이므로
+    인코딩 값: [8, 8, 8, 2]*/
+}
+
+//섀도우 메모리에 인코딩 값 '해제됨'으로 설정(-1)
+void set_shadow_enc_free(void* addr, size_t size) {
+    int8_t* shadow_addr = get_shadow_address(addr);
+    size_t shadow_size = get_shadow_size(size);
+        
+    //섀도우 메모리에 할당 해제됨을 표시
+    memset(shadow_addr, -1, shadow_size);
+}
+
+/*
+메모리 할당, 해제 함수 호출 뒤에 삽입될 함수들
+대상 소스코드의 할당, 해제 함수를 LLVM Pass를 이용해 감지하고 그 뒤에 삽입되어야 함
+malloc, calloc, realloc, aligned_alloc, posix_memalign, free, new, new[], delete, delete[]에 대해 구현
+valloc, pvalloc, memalign은 구식(obsolete)이기 때문에 구현하지 않음. 나중에 필요하다면 구현하면 됨
+new, new[], delete, delete[]는 함수가 아니라 연산자
+IR로 변환하면 @_Znwm, @_Znam, @_ZdlPv, @_ZdaPv 라는 함수호출로 변환됨
+*/
+//after malloc, aligned_alloc, @_Znwm(new), @_Znam(new[])
+void after_malloc(void* addr, size_t size) {
+    if (addr) {
+        set_shadow_enc_alloc(addr, size);
+    }
+}
+
+void after_calloc(void* addr, size_t num, size_t size) {
+    if (addr) {
+        set_shadow_enc_alloc(addr, num * size);
+    }
+}
+
+//realloc은 기존 할당된 주소와 새로할당할 사이즈를 받아 재할당함
+//shadow memory를 관리하기 위해서 기존 영역의 크기를 알아야 함
+//realloc호출시 기존 영역의 크기는 전달되지 않으므로 after_realloc호출할 때 realloc으로 전달되는 포인터의 메타데이터 활용해서 크기(old_size) 전달해야 함
+void after_realloc(void* old_addr, void* new_addr, size_t old_size, size_t new_size) {
+    if (new_addr) {
+        //재할당이므로 기존 영역은 해제됨으로 표시하고 새로 할당된 곳을 할당됨으로 표시 (같은 영역이어도 문제 없음)
+        memset(get_shadow_address(old_addr), -1, get_shadow_size(old_size));
+        set_shadow_enc_alloc(new_addr, new_size);
+    }
+}
+
+void after_posix_memalign(int result, void* addr, size_t size) {
+    if (result == 0) {
+        set_shadow_enc_alloc(addr, size);
+    }
+}
+
+//after free, @_ZdlPv(delete), @_ZdaPv(delete[])
+//free호출시 기존 영역의 크기는 전달되지 않으므로 after_free호출할 때 free로 전달되는 포인터의 메타데이터 활용해서 크기 전달해야 함
+void after_free(void* addr, size_t size) {
+    if (addr) {
+        set_shadow_enc_free(addr, size);
+    }
+}
+
+
+/*할당 함수의 wrapper
+대상 소스코드의 할당 함수를 LLVM Pass를 이용해 감지하고 wrapper함수로 변경
+ex) malloc(size) -> wrapper_malloc(size)
+malloc, calloc, realloc, aligned_alloc, posix_memalign을 구현
+valloc, pvalloc, memalign은 구식(obsolete)이기 때문에 구현하지 않음. 나중에 필요하다면 구현하면 됨
+C++의 new, new[] delete, delete[]는 어떻게?
+함수가 아니라 연산자임, 근데 LLVM IR로 변환하면 @_Znwm, @_Znam, @_ZdlPv, @_ZdaPv 라는 심볼로 변환됨
 void* wrapper_malloc(size_t size) {
     void* addr = malloc(size); //8바이트 정렬된 주소로 할당
     if (addr) {
-        int8_t* shadow_addr = get_shadow_address(addr);
-
-        //8로 나눈 몫과 나머지
-        size_t shadow_full_size = size >> SHADOW_SCALE;
-        size_t shadow_remainder_size = size & ((1 << SHADOW_SCALE) - 1);
-
-        //완전한 8바이트 블록은 인코딩 값 8로 채우고, 나머지 한 블록은 남은 바이트 수가 인코딩 값임
-        if (shadow_full_size) memset(shadow_addr, 8, shadow_full_size);
-        if (shadow_remainder_size) shadow_addr[shadow_full_size] = shadow_remainder_size;
-
-        /*예를들어 26바이트 할당인 경우
-        26 = 8*3 + 2 이므로
-        인코딩 값: [8, 8, 8, 2]*/
+        set_shadow_enc(addr, size);
     }
     return addr;
 }
+
+void* wrapper_calloc(size_t num, size_t size) {
+    void* addr = calloc(num, size);
+    if (addr) {
+        set_shadow_enc(addr, size);
+    }
+    return addr;
+}
+
+//realloc은 기존 할당된 주소와 새로할당할 사이즈를 받아 재할당함
+//shadow memory를 관리하기 위해서 기존 영역의 크기를 알아야 함
+//realloc호출시 기존 영역의 크기는 전달되지 않으므로 realloc -> wrapper_realloc으로 변경하는 Pass 작성시 ptr의 메타데이터 활용해서 크기 전달해야 함
+void* wrapper_realloc(void* ptr, size_t new_size, size_t old_size) {
+    void* addr = realloc(ptr, new_size);
+    if (addr) {
+        //재할당이므로 기존 영역은 해제됨으로 표시하고 새로 할당된 곳을 할당됨으로 표시 (같은 영역이어도 문제 없음)
+        memset(get_shadow_address(ptr), -1, get_shadow_size(old_size));
+        set_shadow_enc(addr, new_size);
+    }
+    return addr;
+}
+
+void* wrapper_aligned_alloc(size_t alignment, size_t size) {
+    void* addr = aligned_alloc(alignment, size);
+    if (addr) {
+        set_shadow_enc(addr, size);
+    }
+    return addr;
+}
+
+int wrapper_posix_memalign(void** memptr, size_t alignment, size_t size) {
+    int result = posix_memalign(memptr, alignment, size);
+    if (result == 0) {
+        set_shadow_enc(*memptr, size);
+    }
+    return result;
+}
+
+
 
 //pass가 적용될 소스코드의 free함수에는 size가 전달되지 않음. softbound에 사용할 메타데이터를 이용해 size를 알아내야 할 듯
 //double free도 감지 가능?
@@ -93,6 +199,12 @@ void wrapper_free(void* addr, size_t size) {
         memset(shadow_addr, -1, shadow_size);
     }
 }
+*/
+
+
+
+
+
 
 //validate_memory_access함수가 부적절한 메모리 접근을 감지하면 호출
 void report_error(void* start_addr, size_t size, int8_t* faulty_shadow_addr) {
