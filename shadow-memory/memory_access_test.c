@@ -20,11 +20,13 @@ int main(int argc, char* argv[]) {
     allocate_shadow_memory();
 
     // 메모리 할당
-    void* base_addr = wrapper_malloc(alloc_size);
+    void* base_addr = malloc(alloc_size);
+    after_malloc(base_addr, alloc_size);
 
     if (free_memory) {
         // 메모리 해제
-        wrapper_free(base_addr, alloc_size);
+        free(base_addr);
+        after_free(base_addr, alloc_size);
     }
 
     // 테스트할 주소 계산
